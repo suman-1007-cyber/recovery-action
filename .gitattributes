@@ -1,0 +1,14 @@
+# Keep Linux-style line endings for everything the Android build / recovery init reads.
+# (A CRLF .rc or .sh file written from Windows breaks init or the installer.)
+*.sh        text eol=lf
+*.py        text eol=lf
+*.rc        text eol=lf
+*.mk        text eol=lf
+*.bp        text eol=lf
+*.yml       text eol=lf
+*.template  text eol=lf
+*.fstab     text eol=lf
+*.flags     text eol=lf
+*.png       binary
+*.pk8       binary
+*.img       binary
