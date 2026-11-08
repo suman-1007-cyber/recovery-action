@@ -1,0 +1,216 @@
+name: Build FinELikEWinE recovery
+
+# Run it by hand: Actions tab -> "Build FinELikEWinE recovery" -> Run workflow.
+# A full run (sync + build) takes roughly 1.5-3 hours on GitHub's free runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device codename (lancelot, merlin, ...)"
+        required: true
+        default: "lancelot"
+        type: string
+      tree_url:
+        description: "Device tree git URL (default = the lancelot tree). Empty = build THIS repository as the tree."
+        required: false
+        default: "https://github.com/mt6768-place/recovery_device_xiaomi_lancelot"
+        type: string
+      tree_branch:
+        description: "Branch of that device tree (only used when tree_url is set)"
+        required: false
+        default: "recovery-12.1"
+        type: string
+      sync_branch:
+        description: "OrangeFox manifest branch to sync"
+        required: true
+        default: "12.1"
+        type: string
+      rebrand:
+        description: "Rewrite the on-screen text OrangeFox -> FinELikEWinE"
+        required: true
+        default: true
+        type: boolean
+      make_release:
+        description: "Also publish the files as a GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write   # only used when make_release is ticked
+
+concurrency:
+  group: finelikewine-${{ inputs.device }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ inputs.device }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      DEVICE: ${{ inputs.device }}
+      FOX_DIR: /home/runner/fox_12.1
+      FWINE_OUT: /home/runner/finelikewine_out   # NOT OUT_DIR: Android's build uses that name itself
+
+    steps:
+      - name: Validate inputs
+        env:
+          TREE_URL: ${{ inputs.tree_url }}
+          TREE_BRANCH: ${{ inputs.tree_branch }}
+          SYNC_BRANCH: ${{ inputs.sync_branch }}
+        run: |
+          [[ "$DEVICE" =~ ^[a-z0-9_]+$ ]]            || { echo "::error::device must be lowercase letters, digits or _"; exit 1; }
+          [[ "$SYNC_BRANCH" =~ ^[A-Za-z0-9._-]+$ ]]  || { echo "::error::bad sync_branch"; exit 1; }
+          [[ "$TREE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad tree_branch"; exit 1; }
+          if [ -n "$TREE_URL" ] && ! [[ "$TREE_URL" =~ ^https://[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::tree_url must be a plain https:// git URL"; exit 1
+          fi
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: this_repo
+
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git aria2 zip unzip openssl python3 imagemagick rsync curl
+          git config --global user.name  "FinELikEWinE CI"
+          git config --global user.email "ci@users.noreply.github.com"
+          git clone --depth 1 https://gitlab.com/OrangeFox/misc/scripts /tmp/fox_scripts
+          (cd /tmp/fox_scripts && sudo bash setup/android_build_env.sh)
+          if ! command -v repo >/dev/null; then
+            sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+            sudo chmod +x /usr/local/bin/repo
+          fi
+
+      - name: Sync OrangeFox source
+        env:
+          SYNC_BRANCH: ${{ inputs.sync_branch }}
+        run: |
+          mkdir -p /home/runner/OrangeFox_sync
+          git clone --depth 1 https://gitlab.com/OrangeFox/sync.git /home/runner/OrangeFox_sync/sync
+          cd /home/runner/OrangeFox_sync/sync
+          ./orangefox_sync.sh --branch "$SYNC_BRANCH" --path "$FOX_DIR"
+          df -h /
+
+      - name: Place the device tree
+        env:
+          TREE_URL: ${{ inputs.tree_url }}
+          TREE_BRANCH: ${{ inputs.tree_branch }}
+        run: |
+          DEST="$FOX_DIR/device/xiaomi/$DEVICE"      # BoardConfig.mk hard-codes this path
+          mkdir -p "$(dirname "$DEST")"
+          if [ -z "$TREE_URL" ]; then
+            echo "Using THIS repository as the device tree"
+            rsync -a --exclude='/.git' --exclude='/.github' --exclude='/tools' \
+                     --exclude='/branding' --exclude='/keys' this_repo/ "$DEST/"
+          else
+            echo "Cloning $TREE_URL ($TREE_BRANCH)"
+            git clone --depth 1 -b "$TREE_BRANCH" "$TREE_URL" "$DEST"
+          fi
+          test -f "$DEST/BoardConfig.mk" || { echo "::error::no BoardConfig.mk in $DEST - wrong repo/branch?"; exit 1; }
+          bash this_repo/tools/fix_tree.sh "$DEST"
+
+      - name: Inspect branding assets (candidate images in the source)
+        run: bash this_repo/tools/apply_branding.sh --list "$FOX_DIR"
+
+      - name: Rebrand on-screen text
+        if: ${{ inputs.rebrand }}
+        continue-on-error: true
+        run: bash this_repo/tools/rebrand_finelikewine.sh --apply "$FOX_DIR"
+
+      - name: Apply branding images
+        run: BRAND_DIR="$PWD/this_repo/branding" bash this_repo/tools/apply_branding.sh --apply "$FOX_DIR"
+
+      - name: Build recovery
+        run: |
+          set -o pipefail
+          mkdir -p "$FWINE_OUT"
+          bash this_repo/tools/build_finelikewine.sh "$DEVICE" 2>&1 | tee "$FWINE_OUT/build.log"
+
+      - name: Make the AOSP-compatible signed zip
+        run: |
+          IMG="$(find "$FWINE_OUT" -maxdepth 1 -name "FinELikEWinE-$DEVICE-*.img" | sort | tail -1)"
+          [ -f "$IMG" ] || { echo "::error::no recovery image in $FWINE_OUT"; exit 1; }
+          TREE="$FOX_DIR/device/xiaomi/$DEVICE"
+          if grep -q 'FOX_TARGET_DEVICES="' "$TREE/vendorsetup.sh"; then DEVARGS=(-T "$TREE"); else DEVARGS=(-D "$DEVICE"); fi
+          bash this_repo/tools/make_recovery_zip.sh -i "$IMG" "${DEVARGS[@]}" -o "${IMG%.img}-sideload.zip"
+          python3 this_repo/tools/sign_ota_zip.py verify "${IMG%.img}-sideload.zip" --cert this_repo/keys/testkey.x509.pem
+          (cd "$FWINE_OUT" && sha256sum -- *.img *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Job summary
+        run: |
+          # shellcheck disable=SC2016  # backticks below are literal Markdown
+          {
+            echo "## FinELikEWinE recovery for \`$DEVICE\`"
+            echo
+            echo '| file | size |'
+            echo '|---|---|'
+            for f in "$FWINE_OUT"/*.img "$FWINE_OUT"/*.zip; do echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+            echo
+            echo '```'
+            cat "$FWINE_OUT/SHA256SUMS.txt"
+            echo '```'
+            echo
+            echo 'Flash with fastboot: `fastboot flash recovery FinELikEWinE-*.img`'
+            echo 'Or from an AOSP-style recovery: `adb sideload FinELikEWinE-*-sideload.zip`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload files
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinELikEWinE-${{ inputs.device }}-run${{ github.run_number }}
+          path: |
+            ${{ env.FWINE_OUT }}/*.img
+            ${{ env.FWINE_OUT }}/*.zip
+            ${{ env.FWINE_OUT }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.device }}-run${{ github.run_number }}
+          path: |
+            ${{ env.FWINE_OUT }}/build.log
+            ${{ env.FOX_DIR }}/out/error.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.make_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ github.run_number }}-$DEVICE"
+          gh release create "$TAG" \
+            "$FWINE_OUT"/*.img "$FWINE_OUT"/*.zip "$FWINE_OUT"/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "FinELikEWinE recovery - $DEVICE (build ${{ github.run_number }})" \
+            --notes "Flash: fastboot flash recovery <the .img>. Or sideload the -sideload.zip from an AOSP-style recovery. Verify with SHA256SUMS.txt. Back up your current recovery first."
