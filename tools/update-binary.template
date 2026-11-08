@@ -1,0 +1,167 @@
+#!/system/bin/sh
+#
+# @NAME@ recovery installer  (built @DATE@)
+#
+# A plain update-binary script. AOSP-style recoveries run it as:
+#     /tmp/update-binary <api-version> <output-pipe-fd> <path-to-zip>
+# It only ever writes the "recovery" partition, after checking the device,
+# the image header, the image checksum and the partition size.
+#
+# POSIX sh only (Android's /system/bin/sh is mksh): no 'local', no [[ ]], no 'echo -e',
+# and no external printf (builtins only for output).
+
+OUTFD="$2"
+ZIPFILE="$3"
+
+IMG_SIZE=@SIZE@
+IMG_SHA256="@SHA256@"
+IMG_OFFSET=@OFFSET@
+ALLOWED_DEVICES="@DEVICES@"
+NAME="@NAME@"
+TMPIMG=/tmp/fwine_recovery.img
+
+# Test hook, ignored unless FWINE_TEST=1 (never set inside a real recovery).
+if [ "$FWINE_TEST" = "1" ] && [ -n "$FWINE_PART" ]; then
+    PART_CANDIDATES="$FWINE_PART"
+    PART_TEST=1
+else
+    PART_CANDIDATES="/dev/block/by-name/recovery /dev/block/bootdevice/by-name/recovery /dev/block/platform/bootdevice/by-name/recovery"
+    PART_TEST=0
+fi
+
+ui_print() {
+    if [ -n "$OUTFD" ] && [ -e "/proc/self/fd/$OUTFD" ]; then
+        { echo "ui_print $1"; echo "ui_print"; } > "/proc/self/fd/$OUTFD"
+    else
+        echo "$1"
+    fi
+}
+
+abort() {
+    ui_print " "
+    ui_print "ERROR: $1"
+    ui_print "Nothing was changed unless stated above."
+    rm -f "$TMPIMG"
+    exit 1
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+
+ui_print " "
+ui_print "=============================="
+ui_print "  $NAME recovery installer"
+ui_print "=============================="
+
+# ---------------------------------------------------------------- 1. device check
+FOUND=""
+MATCH=0
+for p in ro.product.device ro.product.vendor.device ro.build.product ro.product.odm.device; do
+    v="$(getprop $p 2>/dev/null)"
+    [ -n "$v" ] || continue
+    FOUND="$FOUND $v"
+    for d in $ALLOWED_DEVICES; do
+        [ "$v" = "$d" ] && MATCH=1
+    done
+done
+if [ "$MATCH" != "1" ]; then
+    abort "This zip is for: $ALLOWED_DEVICES. This device reports:${FOUND:- nothing}."
+fi
+ui_print "Device check ok."
+
+# ---------------------------------------------------------------- 2. find the partition
+PART=""
+for c in $PART_CANDIDATES; do
+    if [ "$PART_TEST" = "1" ]; then
+        [ -e "$c" ] && PART="$c" && break
+    else
+        [ -b "$c" ] && PART="$c" && break
+    fi
+done
+[ -n "$PART" ] || abort "recovery partition not found."
+ui_print "Partition: $PART"
+
+# ---------------------------------------------------------------- 3. get the image out of the zip
+extract_ok() {
+    [ -f "$TMPIMG" ] && [ "$(file_size "$TMPIMG")" = "$IMG_SIZE" ]
+}
+
+rm -f "$TMPIMG"
+METHOD=""
+if have unzip; then
+    unzip -p "$ZIPFILE" recovery.img > "$TMPIMG" 2>/dev/null
+    if extract_ok; then METHOD="unzip"; else rm -f "$TMPIMG"; fi
+fi
+if [ -z "$METHOD" ] && have busybox; then
+    busybox unzip -p "$ZIPFILE" recovery.img > "$TMPIMG" 2>/dev/null
+    if extract_ok; then METHOD="busybox unzip"; else rm -f "$TMPIMG"; fi
+fi
+if [ -z "$METHOD" ] && have tail && have head; then
+    # recovery.img is the first entry in this zip and is stored uncompressed,
+    # so it can be cut out by byte offset without any unzip tool.
+    tail -c +$((IMG_OFFSET + 1)) "$ZIPFILE" 2>/dev/null | head -c "$IMG_SIZE" > "$TMPIMG" 2>/dev/null
+    if extract_ok; then METHOD="byte offset"; else rm -f "$TMPIMG"; fi
+fi
+[ -n "$METHOD" ] || abort "could not extract recovery.img from the zip."
+ui_print "Image extracted ($METHOD)."
+
+# ---------------------------------------------------------------- 4. verify the image
+MAGIC="$(head -c 8 "$TMPIMG" 2>/dev/null)"
+[ "$MAGIC" = "ANDROID!" ] || abort "recovery.img has no Android boot header."
+
+if have sha256sum; then
+    GOT="$(sha256sum "$TMPIMG" | cut -d' ' -f1)"
+    [ "$GOT" = "$IMG_SHA256" ] || abort "checksum mismatch - the zip is damaged. Re-download it."
+    ui_print "Checksum ok."
+else
+    ui_print "Warning: no sha256sum tool here, skipping checksum."
+fi
+
+# ---------------------------------------------------------------- 5. partition must be big enough
+PSIZE=""
+if have blockdev; then
+    PSIZE="$(blockdev --getsize64 "$PART" 2>/dev/null)"
+fi
+if [ -z "$PSIZE" ] && have readlink; then
+    REAL="$(readlink -f "$PART" 2>/dev/null)"
+    SYS="/sys/class/block/${REAL##*/}/size"
+    if [ -r "$SYS" ]; then
+        SECTORS="$(cat "$SYS" 2>/dev/null)"
+        [ -n "$SECTORS" ] && PSIZE=$((SECTORS * 512))
+    fi
+fi
+if [ -n "$PSIZE" ] && [ "$PSIZE" -gt 0 ] 2>/dev/null; then
+    if [ "$IMG_SIZE" -gt "$PSIZE" ]; then
+        abort "image ($IMG_SIZE bytes) is larger than the partition ($PSIZE bytes)."
+    fi
+    ui_print "Size ok ($IMG_SIZE of $PSIZE bytes)."
+else
+    ui_print "Warning: could not read the partition size, continuing."
+fi
+
+# ---------------------------------------------------------------- 6. flash
+ui_print "Flashing..."
+have blockdev && blockdev --setrw "$PART" >/dev/null 2>&1
+dd if="$TMPIMG" of="$PART" bs=1048576 >/dev/null 2>&1 || {
+    ui_print "Write failed. The recovery partition may now be damaged."
+    ui_print "Do NOT reboot to recovery: flash a recovery.img with fastboot."
+    abort "dd failed."
+}
+sync
+
+# ---------------------------------------------------------------- 7. read back and compare
+if have sha256sum; then
+    BACK="$(head -c "$IMG_SIZE" "$PART" | sha256sum | cut -d' ' -f1)"
+    if [ "$BACK" != "$IMG_SHA256" ]; then
+        ui_print "Read-back mismatch. The recovery partition may be damaged."
+        ui_print "Do NOT reboot to recovery: flash a recovery.img with fastboot."
+        abort "verification after flashing failed."
+    fi
+    ui_print "Verified after flashing."
+fi
+
+rm -f "$TMPIMG"
+ui_print " "
+ui_print "Done. Reboot to recovery to start $NAME."
+exit 0

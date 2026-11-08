@@ -1,0 +1,9 @@
+# Which of YOUR images replaces which file inside the OrangeFox source.
+#   <file in branding/> | <path relative to the source root> | [resize]
+#
+# 1) Run the workflow once. The "Inspect branding assets" step prints every candidate image with its size.
+# 2) Copy a path from that list into a line below (remove the leading '#').
+#
+# Examples (these paths are placeholders - use the real ones from the log):
+# splash_1080x2340.png | bootable/recovery/gui/theme/common/EXAMPLE_splash.png
+# logo_512.png         | bootable/recovery/gui/theme/common/EXAMPLE_logo.png | resize
